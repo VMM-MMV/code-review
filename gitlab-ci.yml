@@ -1,0 +1,257 @@
+image: maven:3.8.5-openjdk-17-slim
+
+# Cache configuration for Maven repository and Sonar cache
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .m2/repository/
+    - /root/.sonar/cache
+    - .sonar/cache
+
+variables:
+  PROJECT_VERSION: ''
+  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository/ -Xmx512m"
+  MAVEN_CLI_OPTS: "-s .m2/settings.xml -B -e -fae --show-version -DinstallAtEnd=true -DdeployAtEnd=true -Dspring.profiles.active=local,test"
+  GIT_DEPTH: 0
+  EUREKA_SERVER: disabled
+  _JAVA_OPTIONS: "--add-exports=java.base/sun.security.x509=ALL-UNNAMED
+   --add-exports=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/sun.security.x509=ALL-UNNAMED
+   --add-opens=java.base/java.lang=ALL-UNNAMED
+   --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+   --add-opens=java.base/java.io=ALL-UNNAMED
+   --add-exports=jdk.unsupported/sun.misc=ALL-UNNAMED
+   --add-opens=java.base/sun.security.tools.keytool=ALL-UNNAMED
+   --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
+
+stages:
+  - compile
+  - test
+  - automated_review
+  - code_quality
+  - build
+  - distribution
+  - package-api
+  - package-upload
+  - package-api-release
+  - package-upload-release
+
+# Compilation Stage
+compile:
+  stage: compile
+  cache:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths:
+      - .m2/repository/
+  script:
+    - PROJECT_VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+    - echo "Compiling PROJECT_VERSION ( $PROJECT_VERSION )"
+    - echo "BUILD_VERSION=$PROJECT_VERSION" >> build.env
+    - mvn $MAVEN_CLI_OPTS clean compile
+  artifacts:
+    reports:
+      dotenv: build.env
+    expire_in: 1 hour
+  only:
+    - master
+    - feature/release-v4
+
+automated_devai_review:
+  stage: automated_review
+  image: git-container-registry.planetgroupint.com:5050/internal/genai-for-developers/devai-cli:latest
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  variables:
+    GIT_STRATEGY: fetch
+    GIT_DEPTH: 0
+  script:
+    - echo "Executing external devai review script..."
+    - pwd
+    - chmod +x resources/scripts/devai-code-review.sh
+    - ./resources/scripts/devai-code-review.sh
+
+# Testing Stage
+test:
+  stage: test
+  cache:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths:
+      - .m2/repository/
+  allow_failure: false
+  script:
+    - "mvn $MAVEN_CLI_OPTS test"
+  artifacts:
+    paths:
+      - core/target/classes/*
+      - web/target/classes/*
+      - web/target/surefire-reports/*
+      - web/target/site/jacoco-aggregate/jacoco.xml
+      - web/target/sonar/checkstyle-result.xml
+      - web/target/jacoco.exec
+      - upload/target/classes/*
+      - upload/target/surefire-reports/*
+      - upload/target/site/jacoco-aggregate/jacoco.xml
+      - upload/target/sonar/checkstyle-result.xml
+      - upload/target/jacoco.exec
+    expire_in: 1 hour
+  only:
+    - master
+
+# Code Quality - Checkstyle
+checkstyle:
+  stage: code_quality
+  image: maven:3.8.5-openjdk-17-slim
+  cache:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths:
+      - .m2/repository/
+  allow_failure: true
+  script:
+    - mvn $MAVEN_CLI_OPTS install -DskipTests
+    - mvn $MAVEN_CLI_OPTS checkstyle:checkstyle
+  only:
+    - release
+
+# Sonar Stage
+sonar:
+  stage: code_quality
+  image: maven:3.8.5-openjdk-17-slim
+  cache:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths:
+      - .m2/repository/
+  dependencies:
+    - test
+  allow_failure: true
+  script:
+    - mvn $MAVEN_CLI_OPTS sonar:sonar -Dsonar.coverage.jacoco.xmlReportPaths=/builds/BT/virtual-dossier/virtual-dossier-api/web/target/site/jacoco-aggregate/jacoco.xml,/builds/BT/virtual-dossier/virtual-dossier-api/upload/target/site/jacoco-aggregate/jacoco.xml -Dsonar.host.url=$SONAR_URL -Dsonar.login=$SONAR_LOGIN
+  only:
+    - master
+
+# Maven Build Stage
+maven-build:
+  image: maven:3.8.5-openjdk-17-slim
+  stage: build
+  cache:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths:
+      - .m2/repository/
+  script: "mvn $MAVEN_CLI_OPTS package -B -Dmaven.test.skip=true"
+  artifacts:
+    paths:
+      - web/target/web-*.jar
+      - upload/target/upload-*.jar
+    expire_in: 1 hour
+  only:
+    - master
+    - release
+    - feature/release-v4
+
+# Docker Build for API using Kaniko
+docker-build-api:
+  stage: package-api
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint:
+      - ''
+  dependencies:
+    - maven-build
+    - compile
+  before_script:
+    - API_IMAGE_NAME_LATEST="$CI_REGISTRY_IMAGE/api:latest"
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"gitlab-ci-token\",\"password\":\"$CI_JOB_TOKEN\"}}}" > /kaniko/.docker/kaniko-config.json
+    - "/kaniko/executor --snapshot-mode=redo --use-new-run --cache=true --cache-copy-layers --cache-run-layers --cleanup --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/docker/Dockerfile --destination $API_IMAGE_NAME_LATEST  --build-arg JAR_FILE=web/target/web-$BUILD_VERSION.jar"
+  only:
+    - master
+
+# Docker Build for Upload using Kaniko
+docker-build-upload:
+  stage: package-upload
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint:
+      - ''
+  dependencies:
+    - maven-build
+    - compile
+  before_script:
+    - UPLOAD_IMAGE_NAME_LATEST="$CI_REGISTRY_IMAGE/upload:latest"
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"gitlab-ci-token\",\"password\":\"$CI_JOB_TOKEN\"}}}" > /kaniko/.docker/kaniko-config.json
+    - "/kaniko/executor --snapshot-mode=redo --use-new-run --cache=true --cache-copy-layers --cache-run-layers --cleanup --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/docker/Dockerfile --destination $UPLOAD_IMAGE_NAME_LATEST --build-arg JAR_FILE=upload/target/upload-$BUILD_VERSION.jar"
+  only:
+    - master
+
+build-api-release:
+  stage: package-api-release
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint:
+      - ''
+  dependencies:
+    - maven-build
+    - compile
+  before_script:
+    - API_IMAGE_NAME="$CI_REGISTRY_IMAGE/api:v$BUILD_VERSION-r"
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"gitlab-ci-token\",\"password\":\"$CI_JOB_TOKEN\"}}}" > /kaniko/.docker/kaniko-config.json
+    - "/kaniko/executor --snapshot-mode=redo --use-new-run --cache=true --cache-copy-layers --cache-run-layers --cleanup --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/docker/Dockerfile --destination $API_IMAGE_NAME --build-arg JAR_FILE=web/target/web-$BUILD_VERSION.jar"
+  only:
+    - release
+
+build-upload-release:
+  stage: package-upload-release
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint:
+      - ''
+  dependencies:
+    - maven-build
+    - compile
+  before_script:
+    - UPLOAD_IMAGE_NAME="$CI_REGISTRY_IMAGE/upload:v$BUILD_VERSION-r"
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"gitlab-ci-token\",\"password\":\"$CI_JOB_TOKEN\"}}}" > /kaniko/.docker/kaniko-config.json
+    - "/kaniko/executor --snapshot-mode=redo --use-new-run --cache=true --cache-copy-layers --cache-run-layers --cleanup --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/docker/Dockerfile --destination $UPLOAD_IMAGE_NAME --build-arg JAR_FILE=upload/target/upload-$BUILD_VERSION.jar"
+  only:
+    - release
+
+docker-build-api-release-v4:
+  stage: package-api
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint:
+      - ''
+  dependencies:
+    - maven-build
+    - compile
+  before_script:
+    - API_IMAGE_NAME_V4="$CI_REGISTRY_IMAGE/api:release-v4-non-client"
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"gitlab-ci-token\",\"password\":\"$CI_JOB_TOKEN\"}}}" > /kaniko/.docker/kaniko-config.json
+    - "/kaniko/executor --snapshot-mode=redo --use-new-run --cache=true --cache-copy-layers --cache-run-layers --cleanup --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/docker/Dockerfile --destination $API_IMAGE_NAME_V4  --build-arg JAR_FILE=web/target/web-$BUILD_VERSION.jar"
+  only:
+    - feature/release-v4
+
+docker-build-upload-release-v4:
+  stage: package-upload
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint:
+      - ''
+  dependencies:
+    - maven-build
+    - compile
+  before_script:
+    - UPLOAD_IMAGE_NAME_V4="$CI_REGISTRY_IMAGE/upload:release-v4-non-client"
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"gitlab-ci-token\",\"password\":\"$CI_JOB_TOKEN\"}}}" > /kaniko/.docker/kaniko-config.json
+    - "/kaniko/executor --snapshot-mode=redo --use-new-run --cache=true --cache-copy-layers --cache-run-layers --cleanup --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/docker/Dockerfile --destination $UPLOAD_IMAGE_NAME_V4 --build-arg JAR_FILE=upload/target/upload-$BUILD_VERSION.jar"
+  only:
+    - feature/release-v4
